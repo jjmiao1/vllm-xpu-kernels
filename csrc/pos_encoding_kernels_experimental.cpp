@@ -44,7 +44,6 @@ class rotary_embedding_vec_kernel {
   void operator() [[sycl::reqd_sub_group_size(32)]] (
       const sycl::nd_item<3>& item_ct1) const {
     using vec_t = sycl::vec<scalar_t, VEC_SIZE>;
-    using pair_t = sycl::vec<scalar_t, 2>;
 
     const int embed_dim = rot_dim / 2;
     const int num_vec_dims = embed_dim / VEC_SIZE;
@@ -74,6 +73,7 @@ class rotary_embedding_vec_kernel {
           *reinterpret_cast<const vec_t*>(sin_ptr + dim_idx);
 
       if constexpr (IS_NEOX) {
+        // NeoX: x-half and y-half are embed_dim apart.
         vec_t q1 =
             *reinterpret_cast<const vec_t*>(&query[q_offset + dim_idx]);
         vec_t q2 = *reinterpret_cast<const vec_t*>(
@@ -88,16 +88,17 @@ class rotary_embedding_vec_kernel {
         *reinterpret_cast<vec_t*>(
             &query[q_offset + embed_dim + dim_idx]) = out_q2;
       } else {
-        for (int v = 0; v < VEC_SIZE; ++v) {
-          const int pair_idx = dim_idx + v;
-          pair_t q_pair = *reinterpret_cast<const pair_t*>(
-              &query[q_offset + pair_idx * 2]);
-          pair_t out_q;
-          out_q[0] = q_pair[0] * cos_vec[v] - q_pair[1] * sin_vec[v];
-          out_q[1] = q_pair[1] * cos_vec[v] + q_pair[0] * sin_vec[v];
-          *reinterpret_cast<pair_t*>(&query[q_offset + pair_idx * 2]) =
-              out_q;
-        }
+        // GPT-J: interleaved (x,y) pairs.  With VEC_SIZE=2, vec_t is
+        // exactly one pair [x, y] — a natural 32-bit load for bf16.
+        static_assert(VEC_SIZE == 2,
+                      "GPT-J path expects VEC_SIZE == 2");
+        vec_t q_pair = *reinterpret_cast<const vec_t*>(
+            &query[q_offset + dim_idx * 2]);
+        vec_t out_q;
+        out_q[0] = q_pair[0] * cos_vec[0] - q_pair[1] * sin_vec[0];
+        out_q[1] = q_pair[1] * cos_vec[0] + q_pair[0] * sin_vec[0];
+        *reinterpret_cast<vec_t*>(
+            &query[q_offset + dim_idx * 2]) = out_q;
       }
     }
 
@@ -132,16 +133,15 @@ class rotary_embedding_vec_kernel {
           *reinterpret_cast<vec_t*>(
               &key[k_offset + embed_dim + dim_idx]) = out_k2;
         } else {
-          for (int v = 0; v < VEC_SIZE; ++v) {
-            const int pair_idx = dim_idx + v;
-            pair_t k_pair = *reinterpret_cast<const pair_t*>(
-                &key[k_offset + pair_idx * 2]);
-            pair_t out_k;
-            out_k[0] = k_pair[0] * cos_vec[v] - k_pair[1] * sin_vec[v];
-            out_k[1] = k_pair[1] * cos_vec[v] + k_pair[0] * sin_vec[v];
-            *reinterpret_cast<pair_t*>(&key[k_offset + pair_idx * 2]) =
-                out_k;
-          }
+          static_assert(VEC_SIZE == 2,
+                        "GPT-J path expects VEC_SIZE == 2");
+          vec_t k_pair = *reinterpret_cast<const vec_t*>(
+              &key[k_offset + dim_idx * 2]);
+          vec_t out_k;
+          out_k[0] = k_pair[0] * cos_vec[0] - k_pair[1] * sin_vec[0];
+          out_k[1] = k_pair[1] * cos_vec[0] + k_pair[0] * sin_vec[0];
+          *reinterpret_cast<vec_t*>(
+              &key[k_offset + dim_idx * 2]) = out_k;
         }
       }
     }
@@ -171,7 +171,8 @@ void call_rotary_embedding_kernel_experimental(
     int64_t head_size,
     torch::Tensor& cos_sin_cache,
     bool is_neox) {
-  constexpr int VEC_SIZE = 4;
+  constexpr int VEC_NEOX = 4;
+  constexpr int VEC_GPTJ = 2;
   using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
   const int64_t num_tokens = positions.numel();
   const int positions_ndim = positions.dim();
@@ -213,7 +214,9 @@ void call_rotary_embedding_kernel_experimental(
   const int64_t head_stride =
       (query_ndim == positions_ndim + 2) ? query.stride(-2) : head_size;
 
-  const bool aligned_embed_dim = embed_dim % VEC_SIZE == 0;
+  // NeoX uses VEC_NEOX=4, GPT-J uses VEC_GPTJ=2.
+  const int vec_size = is_neox ? VEC_NEOX : VEC_GPTJ;
+  const bool aligned_embed_dim = embed_dim % vec_size == 0;
   const bool query_last_dim_contig = query.stride(-1) == 1;
   const bool key_last_dim_contig = !key.has_value() || key->stride(-1) == 1;
   const bool cache_last_dim_contig = cos_sin_cache.stride(1) == 1;
@@ -228,9 +231,7 @@ void call_rotary_embedding_kernel_experimental(
   auto key_ptr = key.has_value() ? key->data_ptr<scalar_t>() : nullptr;
   auto cos_sin_cache_ptr = cos_sin_cache.data_ptr<scalar_t>();
 
-  const int num_vec_dims = embed_dim / VEC_SIZE;
-  // One work-group per token; work-items distribute over (head, vec_dim)
-  // pairs so all heads are processed in parallel, not serially.
+  const int num_vec_dims = embed_dim / vec_size;
   sycl::range<3> grid(1, 1, num_tokens);
   sycl::range<3> block(
       1, 1, std::min<int64_t>(num_heads * num_vec_dims, 512));
@@ -241,7 +242,7 @@ void call_rotary_embedding_kernel_experimental(
     queue.submit([&](sycl::handler& cgh) {
       cgh.parallel_for(
           sycl::nd_range<3>(grid * block, block),
-          vllm::rotary_embedding_vec_kernel<sycl_t, true, VEC_SIZE>(
+          vllm::rotary_embedding_vec_kernel<sycl_t, true, VEC_NEOX>(
               positions_ptr,
               (sycl_t*)query_ptr,
               (sycl_t*)key_ptr,
@@ -258,7 +259,7 @@ void call_rotary_embedding_kernel_experimental(
     queue.submit([&](sycl::handler& cgh) {
       cgh.parallel_for(
           sycl::nd_range<3>(grid * block, block),
-          vllm::rotary_embedding_vec_kernel<sycl_t, false, VEC_SIZE>(
+          vllm::rotary_embedding_vec_kernel<sycl_t, false, VEC_GPTJ>(
               positions_ptr,
               (sycl_t*)query_ptr,
               (sycl_t*)key_ptr,
