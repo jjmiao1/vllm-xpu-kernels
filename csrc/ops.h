@@ -38,6 +38,14 @@ void rotary_embedding(
     torch::Tensor& cos_sin_cache,
     bool is_neox);
 
+void rotary_embedding_experimental(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    std::optional<torch::Tensor> key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox);
+
 void reshape_and_cache(
     torch::Tensor& key,
     torch::Tensor& value,

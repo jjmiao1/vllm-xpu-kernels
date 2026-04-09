@@ -62,6 +62,19 @@ def rotary_embedding(
                                   cos_sin_cache, is_neox)
 
 
+def rotary_embedding_experimental(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    torch.ops._C.rotary_embedding_experimental(positions, query, key,
+                                               head_size, cos_sin_cache,
+                                               is_neox)
+
+
 def deepseek_scaling_rope(
     positions: torch.Tensor,
     query: torch.Tensor,

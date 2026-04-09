@@ -61,6 +61,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   ops.impl("rotary_embedding", torch::kXPU, &rotary_embedding);
 
+  ops.def(
+      "rotary_embedding_experimental(Tensor positions, Tensor! query,"
+      "                              Tensor!? key, int head_size,"
+      "                              Tensor cos_sin_cache, bool is_neox) -> ()");
+  ops.impl(
+      "rotary_embedding_experimental",
+      torch::kXPU,
+      &rotary_embedding_experimental);
+
   // Compute FP8 quantized tensor for given scaling factor.
   ops.def(
       "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale, "
