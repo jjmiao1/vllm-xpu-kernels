@@ -213,9 +213,20 @@ void call_rotary_embedding_kernel_experimental(
   auto cos_sin_cache_ptr = cos_sin_cache.data_ptr<scalar_t>();
 
   const int num_vec_dims = embed_dim / VEC_SIZE;
+
+  // Choose block_size that evenly divides total_q_vecs to eliminate tail
+  // waste (threads sitting idle on the last iteration).  We want the largest
+  // number of heads-per-block (≤ 512/num_vec_dims) that evenly divides
+  // num_heads.  E.g. for nh=80 nv=16: 80%20==0 → block=320, 1280/320=4
+  // exact.  For nh=96 nv=6: 96%48==0 → block=288, 576/288=2 exact.
+  int heads_per_block = std::min<int>(num_heads, 512 / num_vec_dims);
+  while (heads_per_block > 1 && num_heads % heads_per_block != 0) {
+    --heads_per_block;
+  }
+  int block_size = heads_per_block * num_vec_dims;
+
   sycl::range<3> grid(1, 1, num_tokens);
-  sycl::range<3> block(
-      1, 1, std::min<int64_t>(num_heads * num_vec_dims, 512));
+  sycl::range<3> block(1, 1, block_size);
 
   at::DeviceGuard device_guard(query.device());
   auto& queue = vllm::xpu::vllmGetQueue();
