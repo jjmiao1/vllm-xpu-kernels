@@ -264,6 +264,13 @@ def parse_int_list(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def parse_optional_int(value: str) -> int | None:
+    stripped = value.strip().lower()
+    if not stripped or stripped == "all":
+        return None
+    return int(stripped)
+
+
 def parse_bool_list(value: str) -> list[bool]:
     mapping = {
         "true": True,
@@ -507,6 +514,19 @@ def main() -> None:
         "--skip-client-cases",
         action="store_true",
         help="Skip the pre_fa_ops-inspired customer cases at the top of the output.")
+    parser.add_argument(
+        "--skip-synthetic-sweep",
+        action="store_true",
+        help="Skip the synthetic parameter sweep section.")
+    parser.add_argument(
+        "--client-section",
+        choices=["all", "pre_fa", "attn_ops"],
+        default="all",
+        help="Which customer case group to run.")
+    parser.add_argument(
+        "--client-case-index",
+        default="all",
+        help="0-based case index within the selected customer group, or 'all'.")
     args = parser.parse_args()
 
     batch_sizes = parse_int_list(args.batch_sizes)
@@ -520,6 +540,7 @@ def main() -> None:
     dtypes = parse_dtype_list(args.dtypes)
     is_neox_list = parse_bool_list(args.is_neox)
     client_is_neox_list = parse_bool_list(args.client_is_neox)
+    client_case_index = parse_optional_int(args.client_case_index)
     use_key_list = parse_bool_list(args.use_key)
     head_stride_list = parse_bool_list(args.head_stride_contiguous)
 
@@ -552,105 +573,121 @@ def main() -> None:
 
     try:
         if not args.skip_client_cases:
-            print("Client cases from pre_fa_ops.json")
-            print_header(include_mode=True, include_offset=False)
-            for base_case in CLIENT_PRIORITY_CASES:
-                for is_neox in client_is_neox_list:
-                    result = run_case(
-                        batch_size=base_case["batch_size"],
-                        seq_len=base_case["seq_len"],
-                        num_heads=base_case["num_heads"],
-                        num_kv_heads=base_case["num_kv_heads"],
-                        head_size=base_case["head_size"],
-                        rotary_dim=base_case["rotary_dim"],
-                        max_position=max(max_positions + [base_case["seq_len"] + 1]),
-                        dtype=base_case["dtype"],
-                        is_neox=is_neox,
-                        use_key=base_case["use_key"],
-                        head_stride_is_contiguous=base_case[
-                            "head_stride_is_contiguous"],
-                        device=args.device,
-                        warmup=args.warmup,
-                        iters=args.iters,
-                        check=args.check,
-                        attn_mode=base_case["attn_mode"],
-                        rope_offset=0,
-                        include_offset=False,
-                    )
-                    if csv_writer is not None:
-                        csv_writer.writerow([
-                            "client",
-                            result["dtype"],
-                            result["attn_mode"],
-                            result["batch_size"],
-                            result["seq_len"],
-                            result["num_heads"],
-                            result["num_kv_heads"],
-                            result["head_size"],
-                            result["rope_offset"],
-                            result["rotary_dim"],
-                            result["max_position"],
-                            result["is_neox"],
-                            result["use_key"],
-                            result["head_stride_contiguous"],
-                            result["ref_us"],
-                            result["exp_us"],
-                            result["speedup"],
-                        ])
-            print()
+            selected_pre_fa_cases = CLIENT_PRIORITY_CASES
+            selected_attn_ops_cases = ATTN_OPS_PRIORITY_CASES
+            if client_case_index is not None:
+                if args.client_section == "pre_fa":
+                    selected_pre_fa_cases = [CLIENT_PRIORITY_CASES[client_case_index]]
+                    selected_attn_ops_cases = []
+                elif args.client_section == "attn_ops":
+                    selected_pre_fa_cases = []
+                    selected_attn_ops_cases = [ATTN_OPS_PRIORITY_CASES[client_case_index]]
+                else:
+                    raise ValueError(
+                        "--client-case-index requires --client-section pre_fa or attn_ops")
 
-            print("Customer cases from attn_ops.json")
-            print_header(include_mode=True, include_offset=True)
-            for base_case in ATTN_OPS_PRIORITY_CASES:
-                for is_neox in client_is_neox_list:
-                    result = run_case(
-                        batch_size=base_case["batch_size"],
-                        seq_len=base_case["seq_len"],
-                        num_heads=base_case["num_heads"],
-                        num_kv_heads=base_case["num_kv_heads"],
-                        head_size=base_case["head_size"],
-                        rotary_dim=base_case["rotary_dim"],
-                        max_position=max(
-                            max_positions +
-                            [base_case["cache_len"] + base_case["seq_len"] + 1]),
-                        dtype=base_case["dtype"],
-                        is_neox=is_neox,
-                        use_key=base_case["use_key"],
-                        head_stride_is_contiguous=base_case[
-                            "head_stride_is_contiguous"],
-                        device=args.device,
-                        warmup=args.warmup,
-                        iters=args.iters,
-                        check=args.check,
-                        attn_mode=base_case["attn_mode"],
-                        rope_offset=base_case["rope_offset"],
-                        include_offset=True,
-                    )
-                    if csv_writer is not None:
-                        csv_writer.writerow([
-                            "customer_attn_ops",
-                            result["dtype"],
-                            result["attn_mode"],
-                            result["batch_size"],
-                            result["seq_len"],
-                            result["num_heads"],
-                            result["num_kv_heads"],
-                            result["head_size"],
-                            result["rope_offset"],
-                            result["rotary_dim"],
-                            result["max_position"],
-                            result["is_neox"],
-                            result["use_key"],
-                            result["head_stride_contiguous"],
-                            result["ref_us"],
-                            result["exp_us"],
-                            result["speedup"],
-                        ])
-            print()
+            if args.client_section in ("all", "pre_fa") and selected_pre_fa_cases:
+                print("Client cases from pre_fa_ops.json")
+                print_header(include_mode=True, include_offset=False)
+                for base_case in selected_pre_fa_cases:
+                    for is_neox in client_is_neox_list:
+                        result = run_case(
+                            batch_size=base_case["batch_size"],
+                            seq_len=base_case["seq_len"],
+                            num_heads=base_case["num_heads"],
+                            num_kv_heads=base_case["num_kv_heads"],
+                            head_size=base_case["head_size"],
+                            rotary_dim=base_case["rotary_dim"],
+                            max_position=max(max_positions + [base_case["seq_len"] + 1]),
+                            dtype=base_case["dtype"],
+                            is_neox=is_neox,
+                            use_key=base_case["use_key"],
+                            head_stride_is_contiguous=base_case[
+                                "head_stride_is_contiguous"],
+                            device=args.device,
+                            warmup=args.warmup,
+                            iters=args.iters,
+                            check=args.check,
+                            attn_mode=base_case["attn_mode"],
+                            rope_offset=0,
+                            include_offset=False,
+                        )
+                        if csv_writer is not None:
+                            csv_writer.writerow([
+                                "client",
+                                result["dtype"],
+                                result["attn_mode"],
+                                result["batch_size"],
+                                result["seq_len"],
+                                result["num_heads"],
+                                result["num_kv_heads"],
+                                result["head_size"],
+                                result["rope_offset"],
+                                result["rotary_dim"],
+                                result["max_position"],
+                                result["is_neox"],
+                                result["use_key"],
+                                result["head_stride_contiguous"],
+                                result["ref_us"],
+                                result["exp_us"],
+                                result["speedup"],
+                            ])
+                print()
 
-        print("Synthetic sweep")
-        print_header(include_mode=False, include_offset=False)
-        for case in itertools.product(
+            if args.client_section in ("all", "attn_ops") and selected_attn_ops_cases:
+                print("Customer cases from attn_ops.json")
+                print_header(include_mode=True, include_offset=True)
+                for base_case in selected_attn_ops_cases:
+                    for is_neox in client_is_neox_list:
+                        result = run_case(
+                            batch_size=base_case["batch_size"],
+                            seq_len=base_case["seq_len"],
+                            num_heads=base_case["num_heads"],
+                            num_kv_heads=base_case["num_kv_heads"],
+                            head_size=base_case["head_size"],
+                            rotary_dim=base_case["rotary_dim"],
+                            max_position=max(
+                                max_positions +
+                                [base_case["cache_len"] + base_case["seq_len"] + 1]),
+                            dtype=base_case["dtype"],
+                            is_neox=is_neox,
+                            use_key=base_case["use_key"],
+                            head_stride_is_contiguous=base_case[
+                                "head_stride_is_contiguous"],
+                            device=args.device,
+                            warmup=args.warmup,
+                            iters=args.iters,
+                            check=args.check,
+                            attn_mode=base_case["attn_mode"],
+                            rope_offset=base_case["rope_offset"],
+                            include_offset=True,
+                        )
+                        if csv_writer is not None:
+                            csv_writer.writerow([
+                                "customer_attn_ops",
+                                result["dtype"],
+                                result["attn_mode"],
+                                result["batch_size"],
+                                result["seq_len"],
+                                result["num_heads"],
+                                result["num_kv_heads"],
+                                result["head_size"],
+                                result["rope_offset"],
+                                result["rotary_dim"],
+                                result["max_position"],
+                                result["is_neox"],
+                                result["use_key"],
+                                result["head_stride_contiguous"],
+                                result["ref_us"],
+                                result["exp_us"],
+                                result["speedup"],
+                            ])
+                print()
+
+        if not args.skip_synthetic_sweep:
+            print("Synthetic sweep")
+            print_header(include_mode=False, include_offset=False)
+            for case in itertools.product(
                 dtypes,
                 batch_sizes,
                 seq_lens,
@@ -661,58 +698,58 @@ def main() -> None:
                 is_neox_list,
                 use_key_list,
                 head_stride_list):
-            (dtype, batch_size, seq_len, num_heads, head_size, rotary_dim,
-             max_position, is_neox, use_key, head_stride_is_contiguous) = case
+                (dtype, batch_size, seq_len, num_heads, head_size, rotary_dim,
+                 max_position, is_neox, use_key, head_stride_is_contiguous) = case
 
-            if rotary_dim > head_size:
-                continue
-
-            for num_kv_heads in num_kv_heads_list:
-                if num_heads % num_kv_heads != 0:
-                    continue
-                if not use_key and num_kv_heads != num_heads:
+                if rotary_dim > head_size:
                     continue
 
-                result = run_case(
-                    batch_size=batch_size,
-                    seq_len=seq_len,
-                    num_heads=num_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_size,
-                    rotary_dim=rotary_dim,
-                    max_position=max_position,
-                    dtype=dtype,
-                    is_neox=is_neox,
-                    use_key=use_key,
-                    head_stride_is_contiguous=head_stride_is_contiguous,
-                    device=args.device,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    check=args.check,
-                    rope_offset=0,
-                    include_offset=False,
-                )
+                for num_kv_heads in num_kv_heads_list:
+                    if num_heads % num_kv_heads != 0:
+                        continue
+                    if not use_key and num_kv_heads != num_heads:
+                        continue
 
-                if csv_writer is not None:
-                    csv_writer.writerow([
-                        "grid",
-                        result["dtype"],
-                        result["attn_mode"],
-                        result["batch_size"],
-                        result["seq_len"],
-                        result["num_heads"],
-                        result["num_kv_heads"],
-                        result["head_size"],
-                        result["rope_offset"],
-                        result["rotary_dim"],
-                        result["max_position"],
-                        result["is_neox"],
-                        result["use_key"],
-                        result["head_stride_contiguous"],
-                        result["ref_us"],
-                        result["exp_us"],
-                        result["speedup"],
-                    ])
+                    result = run_case(
+                        batch_size=batch_size,
+                        seq_len=seq_len,
+                        num_heads=num_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        rotary_dim=rotary_dim,
+                        max_position=max_position,
+                        dtype=dtype,
+                        is_neox=is_neox,
+                        use_key=use_key,
+                        head_stride_is_contiguous=head_stride_is_contiguous,
+                        device=args.device,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        check=args.check,
+                        rope_offset=0,
+                        include_offset=False,
+                    )
+
+                    if csv_writer is not None:
+                        csv_writer.writerow([
+                            "grid",
+                            result["dtype"],
+                            result["attn_mode"],
+                            result["batch_size"],
+                            result["seq_len"],
+                            result["num_heads"],
+                            result["num_kv_heads"],
+                            result["head_size"],
+                            result["rope_offset"],
+                            result["rotary_dim"],
+                            result["max_position"],
+                            result["is_neox"],
+                            result["use_key"],
+                            result["head_stride_contiguous"],
+                            result["ref_us"],
+                            result["exp_us"],
+                            result["speedup"],
+                        ])
     finally:
         if csv_file is not None:
             csv_file.close()
