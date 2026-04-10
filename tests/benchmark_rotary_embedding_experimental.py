@@ -315,16 +315,65 @@ def dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).split(".")[-1]
 
 
-def benchmark(fn, warmup: int, iters: int) -> float:
+def benchmark(fn, warmup: int, iters: int, timer: str) -> float:
     for _ in range(warmup):
         fn()
     torch.xpu.synchronize()
 
-    start = time.perf_counter()
+    if timer == "host":
+        start = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        torch.xpu.synchronize()
+        return (time.perf_counter() - start) / iters * 1e6
+
+    start_event = torch.xpu.Event(enable_timing=True)
+    end_event = torch.xpu.Event(enable_timing=True)
+    total_time_ms = 0.0
     for _ in range(iters):
+        start_event.record()
         fn()
-    torch.xpu.synchronize()
-    return (time.perf_counter() - start) / iters * 1e6
+        end_event.record()
+        torch.xpu.synchronize()
+        total_time_ms += start_event.elapsed_time(end_event)
+    return total_time_ms / iters * 1e3
+
+
+def make_benchmark_runner(
+    *,
+    op_name: str,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    head_size: int,
+    cache: torch.Tensor,
+    is_neox: bool,
+    benchmark_mode: str,
+    kernel_buffer_count: int,
+):
+    if benchmark_mode == "end_to_end":
+
+        def run() -> None:
+            q = query.clone()
+            k = key.clone() if key is not None else None
+            getattr(torch.ops._C, op_name)(
+                positions, q, k, head_size, cache, is_neox)
+
+        return run
+
+    q_buffers = [query.clone() for _ in range(kernel_buffer_count)]
+    k_buffers = ([key.clone() for _ in range(kernel_buffer_count)]
+                 if key is not None else None)
+    state = {"index": 0}
+
+    def run() -> None:
+        index = state["index"]
+        q = q_buffers[index]
+        k = k_buffers[index] if k_buffers is not None else None
+        getattr(torch.ops._C, op_name)(positions, q, k, head_size, cache, is_neox)
+        state["index"] = (index + 1) % kernel_buffer_count
+
+    return run
 
 
 def make_inputs(
@@ -419,7 +468,10 @@ def run_case(
     device: str,
     warmup: int,
     iters: int,
+    timer: str,
     check: bool,
+    benchmark_mode: str,
+    kernel_buffer_count: int,
     attn_mode: str | None = None,
     rope_offset: int = 0,
     include_offset: bool = False,
@@ -443,20 +495,31 @@ def run_case(
         maybe_check_correctness(
             positions, query, key, head_size, cache, is_neox, dtype)
 
-    def run_ref() -> None:
-        q = query.clone()
-        k = key.clone() if key is not None else None
-        torch.ops._C.rotary_embedding(
-            positions, q, k, head_size, cache, is_neox)
+    run_ref = make_benchmark_runner(
+        op_name="rotary_embedding",
+        positions=positions,
+        query=query,
+        key=key,
+        head_size=head_size,
+        cache=cache,
+        is_neox=is_neox,
+        benchmark_mode=benchmark_mode,
+        kernel_buffer_count=kernel_buffer_count,
+    )
+    run_exp = make_benchmark_runner(
+        op_name="rotary_embedding_experimental",
+        positions=positions,
+        query=query,
+        key=key,
+        head_size=head_size,
+        cache=cache,
+        is_neox=is_neox,
+        benchmark_mode=benchmark_mode,
+        kernel_buffer_count=kernel_buffer_count,
+    )
 
-    def run_exp() -> None:
-        q = query.clone()
-        k = key.clone() if key is not None else None
-        torch.ops._C.rotary_embedding_experimental(
-            positions, q, k, head_size, cache, is_neox)
-
-    ref_us = benchmark(run_ref, warmup, iters)
-    exp_us = benchmark(run_exp, warmup, iters)
+    ref_us = benchmark(run_ref, warmup, iters, timer)
+    exp_us = benchmark(run_exp, warmup, iters, timer)
     ratio = exp_us / ref_us if ref_us > 0 else float("inf")
 
     mode_columns = f" {attn_mode:>21}" if attn_mode is not None else ""
@@ -504,6 +567,21 @@ def main() -> None:
     parser.add_argument("--head-stride-contiguous", default="true,false")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--timer",
+        choices=["host", "xpu_event"],
+        default="host",
+        help="Use host wall-clock timing or device event timing.")
+    parser.add_argument(
+        "--benchmark-mode",
+        choices=["end_to_end", "kernel_only"],
+        default="end_to_end",
+        help="Benchmark end-to-end call cost or only the kernel execution with prebuilt input buffers.")
+    parser.add_argument(
+        "--kernel-buffer-count",
+        type=int,
+        default=1,
+        help="Number of prebuilt input buffers to rotate through in kernel_only mode.")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--csv", default="")
     parser.add_argument(
@@ -543,6 +621,9 @@ def main() -> None:
     client_case_index = parse_optional_int(args.client_case_index)
     use_key_list = parse_bool_list(args.use_key)
     head_stride_list = parse_bool_list(args.head_stride_contiguous)
+
+    if args.kernel_buffer_count < 1:
+        raise ValueError("--kernel-buffer-count must be >= 1")
 
     csv_writer = None
     csv_file = None
@@ -607,7 +688,10 @@ def main() -> None:
                             device=args.device,
                             warmup=args.warmup,
                             iters=args.iters,
+                            timer=args.timer,
                             check=args.check,
+                            benchmark_mode=args.benchmark_mode,
+                            kernel_buffer_count=args.kernel_buffer_count,
                             attn_mode=base_case["attn_mode"],
                             rope_offset=0,
                             include_offset=False,
@@ -657,7 +741,10 @@ def main() -> None:
                             device=args.device,
                             warmup=args.warmup,
                             iters=args.iters,
+                            timer=args.timer,
                             check=args.check,
+                            benchmark_mode=args.benchmark_mode,
+                            kernel_buffer_count=args.kernel_buffer_count,
                             attn_mode=base_case["attn_mode"],
                             rope_offset=base_case["rope_offset"],
                             include_offset=True,
@@ -725,7 +812,10 @@ def main() -> None:
                         device=args.device,
                         warmup=args.warmup,
                         iters=args.iters,
+                        timer=args.timer,
                         check=args.check,
+                        benchmark_mode=args.benchmark_mode,
+                        kernel_buffer_count=args.kernel_buffer_count,
                         rope_offset=0,
                         include_offset=False,
                     )
