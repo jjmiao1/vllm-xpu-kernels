@@ -239,6 +239,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor suffix_output,"
       "    Tensor suffix_lse) -> ()");
   ops.impl("merge_attn_states", torch::kXPU, &merge_attn_states);
+
+  // MiniMax QK Norm split kernels (SYCL, no allreduce inside)
+  ops.def(
+      "minimax_qk_local_variance(Tensor qkv, int q_size, int kv_size)"
+      " -> Tensor");
+  ops.impl("minimax_qk_local_variance", torch::kXPU,
+           &vllm::minimax_qk_local_variance);
+
+  ops.def(
+      "minimax_qk_rms_norm("
+      "Tensor qkv, Tensor qk_var,"
+      "Tensor norm_weight_q, Tensor norm_weight_k,"
+      "int q_size, int kv_size, int tp_world, float eps)"
+      " -> (Tensor, Tensor)");
+  ops.impl("minimax_qk_rms_norm", torch::kXPU, &vllm::minimax_qk_rms_norm);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {

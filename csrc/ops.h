@@ -282,3 +282,21 @@ void merge_attn_states(
     const torch::Tensor& prefix_lse,
     const torch::Tensor& suffix_output,
     const torch::Tensor& suffix_lse);
+
+// MiniMax QK Norm split kernels (SYCL, no allreduce inside)
+namespace vllm {
+torch::Tensor minimax_qk_local_variance(
+    torch::Tensor qkv,
+    int64_t q_size,
+    int64_t kv_size);
+
+std::tuple<torch::Tensor, torch::Tensor> minimax_qk_rms_norm(
+    torch::Tensor qkv,
+    torch::Tensor qk_var,
+    torch::Tensor norm_weight_q,
+    torch::Tensor norm_weight_k,
+    int64_t q_size,
+    int64_t kv_size,
+    int64_t tp_world,
+    double eps);
+} // namespace vllm
